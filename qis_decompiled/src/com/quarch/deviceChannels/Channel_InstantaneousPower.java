@@ -1,0 +1,154 @@
+/*
+ * Decompiled with CFR 0.152.
+ * 
+ * Could not load the following classes:
+ *  QuarchLogging.QuarchLogger
+ */
+package src.com.quarch.deviceChannels;
+
+import QuarchLogging.QuarchLogger;
+import java.util.Arrays;
+import java.util.List;
+import java.util.logging.Level;
+import src.com.quarch.channelFunctions.ChannelDataSourceIF;
+import src.com.quarch.channelFunctions.ChannelFunctionIF;
+import src.com.quarch.channelFunctions.DependentChannel;
+
+public class Channel_InstantaneousPower
+implements ChannelFunctionIF,
+ChannelDataSourceIF {
+    public static final String functionName = "pInstantaneous";
+    private static List<String> xmlDefinition = Arrays.asList(ChannelFunctionIF.asXMLField("name", "pInstantaneous"), ChannelFunctionIF.asXMLField("returnType", "InstantaneousPower"), ChannelFunctionIF.asXMLField("description", "The product of voltage and current."), "<parameters>", "<parameter>", ChannelFunctionIF.nameAsXMLField("source1"), ChannelFunctionIF.typeAsXMLField("chanVoltage"), ChannelFunctionIF.asXMLField("description", "A channel providing voltage values."), "</parameter>", "<parameter>", ChannelFunctionIF.nameAsXMLField("source2"), ChannelFunctionIF.typeAsXMLField("chanCurrent"), ChannelFunctionIF.asXMLField("description", "A channel providing current values."), "</parameter>", "</parameters>");
+    private final String nameStr;
+    private final String groupStr;
+    private final String baseUnits;
+    private String unitsString;
+    private final String origionalCmdStr;
+    private final DependentChannel[] srcChannels = new DependentChannel[2];
+    private double divisor = 1.0;
+    private int value;
+
+    public Channel_InstantaneousPower(String channelStr, String src1ChannelStr, String src2ChannelStr, String units, double divisor, String cmdStr) {
+        this.nameStr = this.keyToStr(channelStr, 0);
+        this.groupStr = this.keyToStr(channelStr, 1);
+        for (int i = 0; i < this.srcChannels.length; ++i) {
+            this.srcChannels[i] = new DependentChannel();
+        }
+        this.srcChannels[0].setNameKey(src1ChannelStr);
+        this.srcChannels[1].setNameKey(src2ChannelStr);
+        this.divisor = divisor;
+        this.baseUnits = units;
+        this.unitsString = units;
+        this.origionalCmdStr = cmdStr;
+    }
+
+    public static ChannelFunctionIF createFromStrings(String chanName, String paramStr, String postAmble, String cmdStr) {
+        int pIdx = 0;
+        String[] parts = paramStr.split(",");
+        while (parts[pIdx].isEmpty()) {
+            ++pIdx;
+        }
+        try {
+            String src1ChannelStr = ChannelFunctionIF.getChannelStr(parts, pIdx);
+            String src2ChannelStr = ChannelFunctionIF.getChannelStr(parts, ++pIdx);
+            if (src1ChannelStr.isEmpty() || src2ChannelStr.isEmpty() || src2ChannelStr.toLowerCase().startsWith("chan(")) {
+                return null;
+            }
+            String units = "VA";
+            double divisor = 1.0;
+            return new Channel_InstantaneousPower(ChannelFunctionIF.getChannelStr(chanName), src1ChannelStr, src2ChannelStr, units, divisor, cmdStr);
+        }
+        catch (Exception exception) {
+            return null;
+        }
+    }
+
+    @Override
+    public int getChannelValue() {
+        return this.value;
+    }
+
+    @Override
+    public int calcDefault() {
+        double v = this.srcChannels[0].getChannelRef().getChannelValue();
+        double a = this.srcChannels[1].getChannelRef().getChannelValue();
+        this.value = v == -2.147483648E9 || a == -2.147483648E9 ? Integer.MIN_VALUE : (int)(v * a / this.divisor);
+        return 0;
+    }
+
+    @Override
+    public int calcResampled() {
+        return this.calcDefault();
+    }
+
+    @Override
+    public String getChannelUnits() {
+        return this.unitsString;
+    }
+
+    @Override
+    public DependentChannel[] getDependentChannels() {
+        return this.srcChannels;
+    }
+
+    @Override
+    public boolean makeActive(long dataSampleTime_nS) {
+        String multiplierStr0 = this.srcChannels[0].getChannelRef().getChannelUnits();
+        String multiplierStr1 = this.srcChannels[1].getChannelRef().getChannelUnits();
+        if (!multiplierStr0.isEmpty() && !multiplierStr1.isEmpty()) {
+            char multiplier0 = multiplierStr0.toLowerCase().charAt(0);
+            char multiplier1 = multiplierStr1.toLowerCase().charAt(0);
+            if (multiplier0 == 'm' && multiplier1 == 'm') {
+                this.divisor = 1000.0;
+                this.unitsString = "m" + this.baseUnits;
+            } else if (multiplier0 == 'm' && multiplier1 == 'u' || multiplier0 == 'u' && multiplier1 == 'm') {
+                this.divisor = 1000.0;
+                this.unitsString = "u" + this.baseUnits;
+            } else {
+                this.divisor = 1.0;
+                QuarchLogger.logMessage((Level)Level.SEVERE, (String)("Cannot resolve Units for <" + this.origionalCmdStr + ">. Channel NOT created"));
+            }
+        }
+        return true;
+    }
+
+    @Override
+    public int getValue() {
+        return 0;
+    }
+
+    @Override
+    public String getNameString() {
+        return this.nameStr;
+    }
+
+    @Override
+    public String getGroupname() {
+        return this.groupStr;
+    }
+
+    @Override
+    public String getUnitsString() {
+        return this.unitsString;
+    }
+
+    @Override
+    public long getMaxTValue() {
+        ChannelDataSourceIF cd1 = this.srcChannels[0].getChannelRef();
+        ChannelDataSourceIF cd2 = this.srcChannels[1].getChannelRef();
+        if (cd1 != null && cd2 != null) {
+            return (long)((double)cd1.getMaxTValue() * (double)cd2.getMaxTValue() / this.divisor);
+        }
+        return -1L;
+    }
+
+    @Override
+    public String getOrigionalCmdStr() {
+        return this.origionalCmdStr;
+    }
+
+    public static List<String> getDefinitionAsXML() {
+        return xmlDefinition;
+    }
+}
+
