@@ -293,20 +293,29 @@ class QuarchUSBHandle:
         padded = cmd.ljust(64, "\0").encode("utf-8")
         self._bulk_write(padded)
 
-        response = bytearray()
+        response_text = ""
         if expected_response:
             while True:
                 chunk = self._bulk_read(self._ep_sz, timeout=USB_TIMEOUT_MS)
+
+                # If we hit a timeout, chunk is b"". Break out to avoid infinite loops.
                 if not chunk:
                     break
 
-                response.extend(chunk)
-                text = response.decode("utf-8", errors="replace").strip('\0')
-                if text.endswith("\n>") or text.endswith("\r\n>") or text.strip() == ">":
+                # EXACTLY mirror the quarchpy chunk evaluation logic
+                decoded = chunk.decode("utf-8", errors="replace")
+                processed_chunk = decoded.strip('\0').strip() + '\r\n'
+
+                # If this specific chunk is the standalone prompt, we are done!
+                if processed_chunk.startswith('>\r\n'):
                     break
+                else:
+                    response_text += processed_chunk
 
         self.last_command_time = timer()
-        return response.decode("utf-8", errors="replace").rstrip("\0>").strip() if expected_response else ""
+
+        # Clean off the trailing \r\n we added and return
+        return response_text.rstrip("\0> \r\n") if expected_response else ""
 
     def read_raw(self, n_bytes: int, timeout_ms: int = USB_TIMEOUT_MS) -> bytes:
         """
