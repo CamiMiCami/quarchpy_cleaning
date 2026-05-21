@@ -1,647 +1,420 @@
 """
-pam_usb_stream.py
-=================
-Prototype: read raw binary stripes from a Quarch PAM (QTL2098/2312/2582/etc.)
-over USB without QIS running.
+pam_usb_stream.py  –  Pure Python PAM USB binary stream (no QIS)
 
-Java reference chain
---------------------
-  qisMain.java              startBackEndInterfaces()
-    → USBStream.java        run() tight loop calling readStream()
-    → CommsDeviceInfo.java  readStream() → qDevice.readStream()
-    → QbeInterfaceWrapper   actionCommandPreamble()
-        sends: "conf stream enable on"  then  "rec stream"
-  RawStripeDataHeader.java  header layout (4 × LE int32)
-  BaseStreamDevicePPM.java  stripe interpretation
+Key fixes vs previous version
+------------------------------
+1. Command: 'rec stream' not 'RECord RUN'
+   QbeInterfaceWrapper.isActionCmd() triggers on startsWith("rec") && endsWith("stream").
+   'RECord RUN' is the PPM internal-buffer command and does nothing on PAM.
 
-USB protocol (PAM over USB)
-----------------------------
-After "rec stream" the device begins pushing binary packets on the SAME
-bulk endpoint used for commands.  Each packet is:
+2. Channel layout: 'config:supports?' (hardware command, QuarchDeviceInfo.getConfigurationXML())
+   not 'stream text header' which is a QIS-layer command unavailable without QIS.
+   Fallback: derive generic channel names from elementsPerStripe in the first packet.
 
-  [ RawStripeDataHeader (16 bytes) ][ stripe data ]
+3. Command pacing: 15 ms minimum gap (RunCommand in connection_USB.py).
 
-RawStripeDataHeader (RawStripeDataHeader.java, all little-endian int32):
-  offset 0  : headerLength        – always 16
-  offset 4  : elementsPerStripe   – number of int16 values per stripe
-  offset 8  : numberOfStripes     – stripes in this packet
-  offset 12 : dataStartRecordNumber
+4. Cursor detection: check if the CURRENT chunk starts with >\r\n (standalone prompt),
+   not whether the accumulated buffer ends with >.  Prevents premature termination
+   when XML responses contain embedded > characters.
+   Mirrors Java FetchCmdReplyTOut exactly.
 
-Each stripe = elementsPerStripe × 2 bytes (int16 LE).
-
-Element layout for PAM (from stream text header XML, element 0 = status word):
-  element 0  : status  (bit 14 = trigger, rest = flags)
-  elements 1+: channel data in the order listed in the XML header
-
-The XML header is fetched via the text command "stream text header" which
-returns a V3 XML block.  We parse it to know units and channel names.
-
-How to run
-----------
-  pip install pyusb libusb (or install libusb system package)
-  python pam_usb_stream.py
-
-  On Linux you may need: sudo python or a udev rule for Quarch USB.
+5. Endpoint direction: libusb Python wrapper handles direction internally;
+   the same address is used for bulkRead and bulkWrite (matches connection_USB.py).
 """
 
-import struct
-import time
-import logging
-import sys
-import xml.etree.ElementTree as ET
+import struct, time, logging, sys, xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from timeit import default_timer as timer
 from typing import Optional
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-7s  %(message)s",
-    datefmt="%H:%M:%S",
-)
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s  %(levelname)-7s  %(message)s",
+                    datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Constants pulled from Java source
-# ─────────────────────────────────────────────────────────────────────────────
-QUARCH_VENDOR_ID  = 0x16D0
-QUARCH_PRODUCT_ID = 0x0449
-
-RAW_STRIPE_HEADER_LEN = 16   # RawStripeDataHeader.java: 4 × int32
-USB_CMD_EP_SIZE       = 64   # QCmdEPSize for non-PIC32 devices
+# ── constants ────────────────────────────────────────────────────────────────
+QUARCH_VENDOR_ID      = 0x16D0
+QUARCH_PRODUCT_ID     = 0x0449
+RAW_STRIPE_HEADER_LEN = 16       # 4 × LE int32  (RawStripeDataHeader.java)
+USB_CMD_EP_SIZE       = 64
 USB_TIMEOUT_MS        = 5000
+CMD_PACE_S            = 0.015    # 15 ms  (RunCommand in connection_USB.py)
+
+PAM_IDS = ["2098","2312","2582","2602","2789","2751","2834","2843"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# RawStripeDataHeader  (RawStripeDataHeader.java)
-# ─────────────────────────────────────────────────────────────────────────────
+# ── RawStripeDataHeader  (RawStripeDataHeader.java) ──────────────────────────
 @dataclass
 class RawStripeDataHeader:
-    header_length:          int   # always 16
-    elements_per_stripe:    int   # number of int16 values per stripe
-    number_of_stripes:      int   # stripes in this USB packet
+    header_length:            int
+    elements_per_stripe:      int
+    number_of_stripes:        int
     data_start_record_number: int
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "RawStripeDataHeader":
-        """
-        streamBytesToInt() in Java does LE assembly byte by byte.
-        struct '<4i' is identical and faster.
-        """
         if len(data) < RAW_STRIPE_HEADER_LEN:
-            raise ValueError(
-                f"Need {RAW_STRIPE_HEADER_LEN} bytes for header, got {len(data)}"
-            )
+            raise ValueError(f"Need 16 bytes for header, got {len(data)}")
         h, e, n, r = struct.unpack_from("<4i", data, 0)
         return cls(h, e, n, r)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Stream XML header parser  (BaseStreamDevicePPM.java  getV3HeaderStrings)
-# ─────────────────────────────────────────────────────────────────────────────
+# ── channel metadata ─────────────────────────────────────────────────────────
 @dataclass
 class ChannelMeta:
     name:          str
     group:         str
     units:         str
-    max_t_value:   int
-    data_position: int   # index into the stripe (0-based, 0 = status)
-
+    data_position: int   # 0=status, 1+ = data
 
 @dataclass
 class StreamMeta:
-    device_period_str: str          # e.g. "4us"
-    device_period_us:  int
-    channels:          list[ChannelMeta] = field(default_factory=list)
-
-
-def parse_stream_xml_header(xml_text: str) -> StreamMeta:
-    """
-    Parse the V3 XML header returned by 'stream text header'.
-
-    The XML looks like (from BaseStreamDevicePPM.java getV3HeaderStrings):
-
-      <?xml version="1.0" ...?>
-      <header>
-        <version>V3</version>
-        <devicePeriod>4us</devicePeriod>
-        <mainPeriod>4us</mainPeriod>
-        ...
-        <channels>
-          <channel>
-            <name>Status</name><group>status</group>
-            <units>NA</units><maxTValue>0</maxTValue>
-            <dataPosition>0</dataPosition>
-          </channel>
-          <channel>
-            <name>5V</name><group>voltage</group>
-            <units>mV</units><maxTValue>...</maxTValue>
-            <dataPosition>1</dataPosition>
-          </channel>
-          ...
-        </channels>
-      </header>
-    """
-    # Strip any leading cursor characters QIS might have added
-    xml_text = xml_text.strip().lstrip(">").strip()
-
-    xml_start = xml_text.find("<?xml")
-    if xml_start == -1:
-        xml_start = xml_text.find("<header")
-
-    if xml_start == -1:
-        # Prevent blind crash, show exactly what garbage we received
-        raise ValueError(f"Failed to find XML start tag. Raw response was: {xml_text[:200]!r}")
-
-    if xml_start > 0:
-        xml_text = xml_text[xml_start:]
-
-    root = ET.fromstring(xml_text)
-
-    # Device period
-    dp_el = root.find(".//devicePeriod")
-    if dp_el is None:
-        dp_el = root.find(".//devicePerioduS")   # older tag name
-    device_period_str = dp_el.text.strip() if dp_el is not None else "4us"
-
-    # Convert period string like "4us" / "100us" to integer microseconds
-    device_period_us = _parse_time_us(device_period_str)
-
-    # Channels
-    channels = []
-    for chan_el in root.findall(".//channel"):
-        def _txt(tag):
-            el = chan_el.find(tag)
-            return el.text.strip() if el is not None else ""
-
-        channels.append(ChannelMeta(
-            name          = _txt("name"),
-            group         = _txt("group"),
-            units         = _txt("units"),
-            max_t_value   = int(_txt("maxTValue") or 0),
-            data_position = int(_txt("dataPosition") or 0),
-        ))
-
-    return StreamMeta(
-        device_period_str = device_period_str,
-        device_period_us  = device_period_us,
-        channels          = channels,
-    )
+    device_period_us: int = 4
+    channels: list = field(default_factory=list)
 
 
 def _parse_time_us(s: str) -> int:
-    """Convert '4us', '100us', '1ms', '4000ns' → integer microseconds."""
     s = s.strip().lower()
-    if s.endswith("ns"):
-        return max(1, int(s[:-2]) // 1000)
-    if s.endswith("us"):
-        return int(s[:-2])
-    if s.endswith("ms"):
-        return int(s[:-2]) * 1000
-    if s.endswith("s"):
-        return int(s[:-1]) * 1_000_000
-    return int(s)   # fallback: assume µs
+    if s.endswith("ns"): return max(1, int(s[:-2]) // 1000)
+    if s.endswith("us"): return int(s[:-2])
+    if s.endswith("ms"): return int(s[:-2]) * 1000
+    if s.endswith("s"):  return int(s[:-1]) * 1_000_000
+    return int(s)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Low-level USB handle  (mirrors TQuarchUSB_IF in connection_USB.py)
-# ─────────────────────────────────────────────────────────────────────────────
+# ── parse config:supports? XML ───────────────────────────────────────────────
+def parse_config_xml(xml_text: str) -> list:
+    """
+    Extract channel info from 'config:supports?' response.
+    Returns list[ChannelMeta] or [] if parsing fails.
+    QuarchDeviceInfo.getConfigurationXML() sends this command.
+    """
+    xml_text = xml_text.strip()
+    start = xml_text.find("<?xml")
+    if start == -1: start = xml_text.find("<")
+    if start == -1: return []
+    try:
+        root = ET.fromstring(xml_text[start:])
+    except ET.ParseError as exc:
+        log.warning("config:supports? XML parse error: %s", exc)
+        return []
+
+    channels, pos = [], 1
+    for ch in root.iter("channel"):
+        name_el = ch.find("name")
+        if name_el is None: continue
+        name = (name_el.text or "").strip()
+        if name.lower() in ("status", "trigger", ""): continue
+        group = (ch.findtext("group") or "data").strip()
+        units = (ch.findtext("units") or "raw").strip()
+        channels.append(ChannelMeta(name=name, group=group,
+                                    units=units, data_position=pos))
+        pos += 1
+    return channels
+
+
+def generic_channels(n_elements: int) -> list:
+    """Fallback: label channels ch1, ch2, … from elementsPerStripe."""
+    return [ChannelMeta(name=f"ch{i}", group="data", units="raw", data_position=i)
+            for i in range(1, n_elements)]
+
+
+# ── USB handle ───────────────────────────────────────────────────────────────
 class QuarchUSBHandle:
-    """
-    Minimal USB handle wrapping usb1 (libusb).
-
-    We open ONE handle for the PAM.  Commands go via bulk-write/read on the
-    command endpoint.  After 'rec stream' the device pushes binary data back
-    on the SAME endpoint – we just keep bulk-reading until we decide to stop.
-    """
-
-    # Lock / unlock magic bytes (from TQuarchUSB_IF)
-    _LOCK_CMD   = b'\x02\x00\x00\x01\x04\x01'
-    _UNLOCK_CMD = b'\x02\x00\x00\x01\x03\x00'
+    _LOCK   = b'\x02\x00\x00\x01\x04\x01'
+    _UNLOCK = b'\x02\x00\x00\x01\x03\x00'
 
     def __init__(self, context, device):
-        self._ctx    = context
-        self._dev    = device
+        self._ctx, self._dev = context, device
         self._handle = None
-        self._ep     = 0
-        self._ep_sz  = USB_CMD_EP_SIZE
-        self._iface  = 0
-
-        self.last_command_time = timer()
+        self._ep = 0
+        self._ep_sz = USB_CMD_EP_SIZE
+        self._iface = 0
+        self._last_cmd = timer()          # Fix 3: pacing
 
     def open(self) -> bool:
         import platform
         self._handle = self._dev.open()
         if self._handle is None:
             return False
-
         if platform.system() == "Linux":
-            if self._handle.kernelDriverActive(self._iface):
-                self._handle.detachKernelDriver(self._iface)
-
+            try:
+                if self._handle.kernelDriverActive(self._iface):
+                    self._handle.detachKernelDriver(self._iface)
+            except Exception: pass
         self._handle.claimInterface(self._iface)
 
-        # Find the highest-numbered OUT endpoint (same logic as TQuarchUSB_IF)
-        ep_addr = 0
+        # Find highest OUT endpoint — same logic as TQuarchUSB_IF.
+        # libusb wrapper uses same address for read & write; no 0x80 OR needed.
+        ep = 0
         for cfg in self._dev.iterConfiguations():
-            if cfg.getConfigurationValue() != 1:
-                continue
+            if cfg.getConfigurationValue() != 1: continue
             for intf in cfg.iterInterfaces():
                 for setting in intf.iterSettings():
-                    if setting.getNumber() != 0:
-                        continue
-                    for ep in setting.iterEndpoints():
-                        addr = ep.getAddress()
-                        if ep_addr < addr < 0x80:   # OUT endpoint
-                            ep_addr = addr
-        if ep_addr:
-            self._ep = ep_addr
-
+                    if setting.getNumber() != 0: continue
+                    for endpoint in setting.iterEndpoints():
+                        addr = endpoint.getAddress()
+                        if ep < addr < 0x80:
+                            ep = addr
+        if ep: self._ep = ep
         self._ep_sz = self._dev.getMaxPacketSize(self._ep)
-        log.debug("USB EP=0x%02x  EP_SIZE=%d", self._ep, self._ep_sz)
+        log.debug("USB  EP=0x%02x  EP_SZ=%d", self._ep, self._ep_sz)
 
-        # Lock the device into USB mode (PIC32 devices need the lock sequence)
-        if self._ep_sz <= 64:
-            self._bulk_write(self._UNLOCK_CMD)
-            self._bulk_read(self._ep_sz, timeout=500)
-            self._bulk_write(self._LOCK_CMD)
-            self._bulk_read(self._ep_sz, timeout=500)
-
+        if self._ep_sz <= 64:           # PIC32 lock sequence
+            self._write(self._UNLOCK); self._read(self._ep_sz, 500)
+            self._write(self._LOCK);   self._read(self._ep_sz, 500)
         return True
 
     def close(self):
-        if self._handle is None:
-            return
+        if not self._handle: return
         if self._ep_sz <= 64:
-            try:
-                self._bulk_write(self._UNLOCK_CMD)
-                self._bulk_read(self._ep_sz, timeout=500)
-            except Exception:
-                pass
-        try:
-            self._handle.releaseInterface(self._iface)
-        except Exception:
-            pass
+            try: self._write(self._UNLOCK); self._read(self._ep_sz, 300)
+            except Exception: pass
+        try: self._handle.releaseInterface(self._iface)
+        except Exception: pass
         self._handle = None
 
-    def send_command(self, cmd: str, expected_response: bool = True) -> str:
+    def send_command(self, cmd: str, wait: bool = True) -> str:
         """
-        Send a text command. If expected_response is True, wait for the '>' prompt.
+        Send cmd padded to 64 bytes.  Read until standalone '>' prompt.
+
+        Fix 3: 15 ms pacing.
+        Fix 4: cursor = chunk that starts with >\r\n after null-stripping.
+               Avoids false break on XML containing > inside tags.
+               Mirrors Java FetchCmdReplyTOut.
         """
-        if (timer() - self.last_command_time < 0.015):
-            time.sleep(0.015)
+        gap = CMD_PACE_S - (timer() - self._last_cmd)
+        if gap > 0: time.sleep(gap)
 
-        padded = cmd.ljust(64, "\0").encode("utf-8")
-        self._bulk_write(padded)
+        self._write(cmd.ljust(64, "\0").encode("utf-8"))
+        self._last_cmd = timer()
 
-        response_text = ""
-        if expected_response:
-            while True:
-                chunk = self._bulk_read(self._ep_sz, timeout=USB_TIMEOUT_MS)
+        if not wait:
+            return ""
 
-                # If we hit a timeout, chunk is b"". Break out to avoid infinite loops.
-                if not chunk:
-                    break
+        response = ""
+        while True:
+            chunk = self._read(self._ep_sz, USB_TIMEOUT_MS)
+            if not chunk:
+                log.debug("send_command: timeout waiting for cursor")
+                break
+            # Mirror Java: strip nulls, strip whitespace, add \r\n, check prefix
+            processed = chunk.decode("utf-8", errors="replace").strip("\0").strip() + "\r\n"
+            if processed.startswith(">\r\n"):
+                break                   # standalone prompt — done
+            response += processed
 
-                # EXACTLY mirror the quarchpy chunk evaluation logic
-                decoded = chunk.decode("utf-8", errors="replace")
-                processed_chunk = decoded.strip('\0').strip() + '\r\n'
+        return response.strip("\0> \r\n")
 
-                # If this specific chunk is the standalone prompt, we are done!
-                if processed_chunk.startswith('>\r\n'):
-                    break
-                else:
-                    response_text += processed_chunk
+    def flush(self, timeout_ms: int = 100) -> int:
+        n = 0
+        while True:
+            c = self._read(4096, timeout_ms)
+            if not c: break
+            n += len(c)
+        if n: log.debug("flush: discarded %d bytes", n)
+        return n
 
-        self.last_command_time = timer()
+    def read_raw(self, n: int = 4096, timeout_ms: int = 1000) -> bytes:
+        return self._read(n, timeout_ms)
 
-        # Clean off the trailing \r\n we added and return
-        return response_text.rstrip("\0> \r\n") if expected_response else ""
+    def _write(self, data: bytes):
+        self._handle.bulkWrite(endpoint=self._ep, data=data, timeout=USB_TIMEOUT_MS)
 
-    def read_raw(self, n_bytes: int, timeout_ms: int = USB_TIMEOUT_MS) -> bytes:
-        """
-        Read raw bytes from the USB bulk endpoint.
-        Used for stream data after 'rec stream' is sent.
-        """
-        return self._bulk_read(n_bytes, timeout=timeout_ms)
-
-    # ── private ────────────────────────────────────────────────────────────
-    def _bulk_write(self, data: bytes):
-        self._handle.bulkWrite(
-            endpoint = self._ep,
-            data     = data,
-            timeout  = USB_TIMEOUT_MS,
-        )
-
-    def _bulk_read(self, n: int, timeout: int = USB_TIMEOUT_MS) -> bytes:
-        try:
-            return bytes(self._handle.bulkRead(self._ep, n, timeout))
+    def _read(self, n: int, timeout: int = USB_TIMEOUT_MS) -> bytes:
+        try:   return bytes(self._handle.bulkRead(self._ep, n, timeout))
         except Exception as exc:
-            log.debug("bulk_read timeout/error: %s", exc)
-            return b""
+            log.debug("bulk_read: %s", exc); return b""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Stream session
-# ─────────────────────────────────────────────────────────────────────────────
+# ── stream session ───────────────────────────────────────────────────────────
 class PAMStreamSession:
-    """
-    Opens the PAM over USB, configures it, starts streaming,
-    reads N stripes, stops, and yields decoded results.
 
-    Mirrors the sequence in QbeInterfaceWrapper.actionCommandPreamble()
-    + USBStream.run().
-    """
-
-    def __init__(self, usb_handle: QuarchUSBHandle):
-        self._h = usb_handle
+    def __init__(self, h: QuarchUSBHandle):
+        self._h = h
         self.meta: Optional[StreamMeta] = None
 
-    # ── setup ──────────────────────────────────────────────────────────────
     def configure(self):
-        """Send pre-stream configuration commands (from actionCommandPreamble)."""
-        log.info("Enabling stream interface on device...")
+        log.info("Configuring device...")
         r = self._h.send_command("conf stream enable on")
-        log.info("  conf stream enable on → %s", r)
+        log.info("  conf stream enable on → %r", r)
 
-    def get_stream_header(self) -> StreamMeta:
-        log.info("Fetching stream XML header...")
+    def discover_channels(self) -> StreamMeta:
+        """
+        Query hardware for channel layout via 'config:supports?'.
+        Falls back to generic names if XML is absent or unparseable.
+        """
+        log.info("Querying channel layout (config:supports?)...")
+        xml = self._h.send_command("config:supports?")
+        channels = parse_config_xml(xml) if xml else []
 
-        self._h.send_command("stream mode header v3")
-        xml_raw = self._h.send_command("stream text header")
+        if channels:
+            log.info("  Got %d channels from device XML:", len(channels))
+            for ch in channels:
+                log.info("    [%d] %-18s group=%-10s units=%s",
+                         ch.data_position, ch.name, ch.group, ch.units)
+        else:
+            log.info("  No channel XML — will derive from first stream packet.")
 
-        if "Not Available" in xml_raw or "<?xml" not in xml_raw:
-            log.warning("XML header not available yet – running dummy stream to initialize...")
-
-            # Fire and forget: do NOT wait for text, because binary is about to hit the pipe
-            self._h.send_command("RECord RUN", expected_response=False)
-            time.sleep(0.1)
-            self._h.send_command("RECord STOP", expected_response=False)
-            time.sleep(0.1)
-
-            # Flush the USB pipe of all residual binary stripes
-            flushed_bytes = 0
-            while True:
-                junk = self._h.read_raw(4096, timeout_ms=50)
-                if not junk:
-                    break
-                flushed_bytes += len(junk)
-            log.debug("Flushed %d bytes of residual binary data from USB pipe", flushed_bytes)
-
-            # Send a blank command to force the module to emit a fresh '>' prompt to sync up
-            self._h.send_command("")
-
-            # Now safely request the XML
-            xml_raw = self._h.send_command("stream text header")
-
-        self.meta = parse_stream_xml_header(xml_raw)
-        log.info("Stream meta: period=%s  channels=%d",
-                 self.meta.device_period_str, len(self.meta.channels))
-        for ch in self.meta.channels:
-            log.info("  [%d] %-20s  group=%-10s  units=%s",
-                     ch.data_position, ch.name, ch.group, ch.units)
+        self.meta = StreamMeta(device_period_us=4, channels=channels)
         return self.meta
 
-    # ── stream ─────────────────────────────────────────────────────────────
-    def stream_stripes(self, n_stripes: int = 100, timeout_s: float = 10.0):
+    def stream_stripes(self, n: int = 200, timeout_s: float = 20.0):
         """
-        Start streaming, collect n_stripes decoded stripe dicts, then stop.
-
-        Yields dicts like:
-          {
-            'record_number': 42,
-            'time_us':       168,
-            'trigger':       False,
-            'channels': {
-                '5V voltage': {'value': 4987, 'units': 'mV'},
-                '5V current': {'value':  312, 'units': 'mA'},
-                ...
-            }
-          }
+        Send 'rec stream', yield decoded stripe dicts, then stop.
+        Uses 'rec stop' to end (matches QbeInterfaceWrapper action command pair).
         """
         if self.meta is None:
-            self.get_stream_header()
+            self.discover_channels()
 
-        # Build lookup: data_position → ChannelMeta (skip status at position 0)
-        chan_by_pos = {ch.data_position: ch for ch in self.meta.channels
-                       if ch.data_position > 0}
+        chan_by_pos = {ch.data_position: ch for ch in self.meta.channels}
 
-        log.info("Starting stream (target=%d stripes)...", n_stripes)
-        r = self._h.send_command("RECord RUN")
-        log.info("  RECord RUN → %s", r)
+        # Fix 1: correct streaming command for PAM
+        log.info("Starting stream with 'rec stream'...")
+        r = self._h.send_command("rec stream")
+        log.info("  rec stream → %r", r)
+        if "fail" in r.lower():
+            raise RuntimeError(
+                f"rec stream failed: {r!r}\n"
+                "Possible causes: DUT power off (try 'run:power up'), "
+                "or device already streaming.")
 
-        collected   = 0
-        deadline    = time.monotonic() + timeout_s
-        raw_buffer  = bytearray()
+        collected = 0
+        deadline  = time.monotonic() + timeout_s
+        buf       = bytearray()
+        ch_final  = bool(self.meta.channels)
 
         try:
-            while collected < n_stripes and time.monotonic() < deadline:
-                # ── read a chunk from the USB bulk endpoint ──────────────
-                # The device sends RawStripeDataHeader(16) + stripe data
-                # packets continuously.  We read in large chunks and
-                # reassemble packets from the byte stream.
+            while collected < n and time.monotonic() < deadline:
                 chunk = self._h.read_raw(4096, timeout_ms=1000)
                 if chunk:
-                    raw_buffer.extend(chunk)
+                    buf.extend(chunk)
 
-                # ── consume complete packets from the buffer ─────────────
-                while len(raw_buffer) >= RAW_STRIPE_HEADER_LEN:
-                    hdr = RawStripeDataHeader.from_bytes(raw_buffer)
+                while len(buf) >= RAW_STRIPE_HEADER_LEN:
+                    hdr = RawStripeDataHeader.from_bytes(buf)
 
-                    # Sanity check the header
                     if hdr.header_length != RAW_STRIPE_HEADER_LEN:
-                        # Out of sync – discard one byte and try again
-                        log.warning("Header length mismatch (%d) – resyncing",
-                                    hdr.header_length)
-                        raw_buffer = raw_buffer[1:]
-                        continue
+                        log.warning("Bad header_length=%d — resyncing", hdr.header_length)
+                        buf = buf[1:]; continue
 
-                    stripe_sz    = hdr.elements_per_stripe * 2  # int16 = 2 bytes
-                    packet_sz    = RAW_STRIPE_HEADER_LEN + hdr.number_of_stripes * stripe_sz
+                    stripe_sz  = hdr.elements_per_stripe * 2
+                    packet_sz  = RAW_STRIPE_HEADER_LEN + hdr.number_of_stripes * stripe_sz
+                    if len(buf) < packet_sz:
+                        break
 
-                    if len(raw_buffer) < packet_sz:
-                        break   # wait for more data
+                    packet, buf = bytes(buf[:packet_sz]), buf[packet_sz:]
 
-                    # Extract the full packet
-                    packet = raw_buffer[:packet_sz]
-                    raw_buffer = raw_buffer[packet_sz:]
+                    if not ch_final:
+                        self.meta.channels = generic_channels(hdr.elements_per_stripe)
+                        chan_by_pos = {ch.data_position: ch for ch in self.meta.channels}
+                        ch_final = True
+                        log.info("Derived %d generic channels (elementsPerStripe=%d)",
+                                 len(self.meta.channels), hdr.elements_per_stripe)
 
-                    # Decode each stripe in this packet
-                    data_offset = RAW_STRIPE_HEADER_LEN
-                    for s_idx in range(hdr.number_of_stripes):
-                        if collected >= n_stripes:
-                            break
-
-                        stripe_raw = packet[data_offset : data_offset + stripe_sz]
-                        data_offset += stripe_sz
-
-                        decoded = self._decode_stripe(
-                            stripe_raw,
-                            hdr.data_start_record_number + s_idx,
-                            chan_by_pos,
-                        )
-                        yield decoded
-                        collected += 1
+                    off = RAW_STRIPE_HEADER_LEN
+                    for si in range(hdr.number_of_stripes):
+                        if collected >= n: break
+                        yield self._decode(packet[off:off+stripe_sz],
+                                           hdr.data_start_record_number + si,
+                                           chan_by_pos)
+                        off += stripe_sz; collected += 1
 
         finally:
-            log.info("Stopping stream (collected %d stripes)...", collected)
-            self._h.send_command("RECord STOP")
-            # Drain any residual bytes so the next command channel is clean
-            time.sleep(0.1)
-            self._h.read_raw(4096, timeout_ms=200)
+            log.info("Stopping (%d stripes collected)...", collected)
+            self._h.flush(50)
+            r = self._h.send_command("rec stop")
+            log.info("  rec stop → %r", r)
+            self._h.flush(100)
 
-    # ── decode ─────────────────────────────────────────────────────────────
-    def _decode_stripe(self, raw: bytes, record_number: int,
-                       chan_by_pos: dict) -> dict:
-        """
-        Decode one stripe.
-
-        Element 0 is always the status word:
-          bit 15 = valid
-          bit 14 = trigger
-          bits 0-13 = status flags
-
-        Elements 1+ are channel data values.
-        Units and scale come from the XML header – the raw int16 value
-        is already in the units stated (mV, mA, etc.) because the PAM
-        firmware applies scaling internally before streaming.
-        """
-        if len(raw) < 2:
-            return {}
-
-        # Status word (element 0)
-        status_raw = struct.unpack_from("<H", raw, 0)[0]
-        trigger    = bool(status_raw & 0x4000)
-        valid      = bool(status_raw & 0x8000)
-
+    def _decode(self, raw: bytes, rec_no: int, chan_by_pos: dict) -> dict:
+        if len(raw) < 2: return {}
+        status  = struct.unpack_from("<H", raw, 0)[0]
+        trigger = bool(status & 0x4000)
+        valid   = bool(status & 0x8000)
         channels = {}
-        n_elements = len(raw) // 2
-
-        for pos in range(1, n_elements):
-            if pos * 2 + 2 > len(raw):
-                break
-            raw_val = struct.unpack_from("<h", raw, pos * 2)[0]  # signed int16
-
-            ch = chan_by_pos.get(pos)
-            if ch:
-                channels[f"{ch.name} {ch.group}"] = {
-                    "value": raw_val,
-                    "units": ch.units,
-                    "name":  ch.name,
-                    "group": ch.group,
-                }
-            else:
-                channels[f"element_{pos}"] = {"value": raw_val, "units": "raw"}
-
+        for pos in range(1, len(raw) // 2):
+            if pos*2+2 > len(raw): break
+            val = struct.unpack_from("<h", raw, pos*2)[0]
+            ch  = chan_by_pos.get(pos)
+            key = f"{ch.name}:{ch.group}" if ch else f"elem_{pos}"
+            channels[key] = {
+                "value": val,
+                "units": ch.units if ch else "raw",
+                "name":  ch.name  if ch else f"elem_{pos}",
+                "group": ch.group if ch else "unknown",
+            }
         return {
-            "record_number": record_number,
-            "time_us":       record_number * (self.meta.device_period_us
-                                              if self.meta else 4),
+            "record_number": rec_no,
+            "time_us":       rec_no * self.meta.device_period_us,
             "trigger":       trigger,
             "valid":         valid,
             "channels":      channels,
         }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Device scanner  (mirrors list_USB in scanDevices.py)
-# ─────────────────────────────────────────────────────────────────────────────
-def find_pam_device():
-    """
-    Find the first Quarch PAM on USB.
-    Returns (context, device) or raises RuntimeError.
-    """
+# ── device finder ─────────────────────────────────────────────────────────────
+def find_pam():
     try:
         from quarchpy.connection_specific.connection_USB import importUSB
         usb1 = importUSB()
     except Exception as exc:
-        raise RuntimeError(f"Cannot import usb1/libusb: {exc}") from exc
-
-    ctx  = usb1.USBContext()
-    devs = ctx.getDeviceList()
-
-    for dev in devs:
-        if (hex(dev.device_descriptor.idVendor)  == hex(QUARCH_VENDOR_ID) and
-            hex(dev.device_descriptor.idProduct) == hex(QUARCH_PRODUCT_ID)):
-
-            # Try to read the serial number to confirm it's a PAM
-            try:
-                h = dev.open()
-                sn = h.getASCIIStringDescriptor(3)
-                h.close()
-                log.info("Found Quarch device: %s", sn)
-                # PAM / MOM device numbers: 2098, 2312, 2582, 2602, 2789 etc.
-                pam_ids = ["2098", "2312", "2582", "2602", "2789", "2751",
-                           "2834", "2843"]
-                if any(pid in sn for pid in pam_ids):
-                    log.info("Identified as PAM/MOM device.")
-                    return ctx, dev
-                else:
-                    log.warning("Device %s does not look like a PAM – using it anyway",
-                                sn)
-                    return ctx, dev   # try it anyway for prototyping
-            except Exception as exc:
-                log.warning("Could not read serial number: %s", exc)
-                return ctx, dev
-
-    raise RuntimeError("No Quarch USB device found. "
-                       "Check USB connection and permissions.")
+        raise RuntimeError(f"Cannot load libusb via quarchpy: {exc}") from exc
+    ctx = usb1.USBContext()
+    for dev in ctx.getDeviceList():
+        if (hex(dev.device_descriptor.idVendor)  != hex(QUARCH_VENDOR_ID) or
+            hex(dev.device_descriptor.idProduct) != hex(QUARCH_PRODUCT_ID)):
+            continue
+        try:
+            h = dev.open(); sn = h.getASCIIStringDescriptor(3); h.close()
+        except Exception: sn = "unknown"
+        log.info("Found Quarch USB: %s", sn)
+        return ctx, dev
+    raise RuntimeError("No Quarch USB device found.")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main demo
-# ─────────────────────────────────────────────────────────────────────────────
+# ── main ──────────────────────────────────────────────────────────────────────
 def main():
     print("=" * 65)
-    print("  Quarch PAM  –  Pure Python USB Binary Stream (no QIS)")
+    print("  Quarch PAM  –  Pure Python USB Binary Stream  (no QIS)")
     print("=" * 65)
 
-    N_STRIPES = 200   # how many stripes to collect
-
-    # 1. Find the device
-    log.info("Scanning USB for Quarch PAM...")
-    ctx, dev = find_pam_device()
-
-    # 2. Open USB handle
-    handle = QuarchUSBHandle(ctx, dev)
-    if not handle.open():
-        log.error("Failed to open USB handle.")
-        sys.exit(1)
+    ctx, dev = find_pam()
+    h = QuarchUSBHandle(ctx, dev)
+    if not h.open():
+        log.error("Failed to open USB handle."); sys.exit(1)
     log.info("USB handle opened.")
 
-    session = PAMStreamSession(handle)
-
+    session = PAMStreamSession(h)
     try:
-        # 3. Pre-stream configuration (mirrors actionCommandPreamble)
+        idn = h.send_command("*idn?")
+        log.info("*idn? → %s", idn[:120])
+
+        pwr = h.send_command("run:power?")
+        log.info("run:power? → %r", pwr)
+        if pwr and ("off" in pwr.lower() or "pulled" in pwr.lower()):
+            log.info("Powering up DUT rails...")
+            h.send_command("run:power up"); time.sleep(1.0)
+
         session.configure()
+        meta = session.discover_channels()
 
-        # 4. Fetch the XML header so we know channel names/units
-        meta = session.get_stream_header()
-
-        # 5. Stream N stripes and print them
-        print(f"\nCollecting {N_STRIPES} stripes "
-              f"(period={meta.device_period_str})...\n")
-
-        header_printed = False
-        for stripe in session.stream_stripes(n_stripes=N_STRIPES, timeout_s=15):
-            if not header_printed:
-                # Print column headers on first stripe
-                ch_names = [f"{v['name']} ({v['units']})"
-                            for v in stripe["channels"].values()]
-                print(f"  {'rec#':>6}  {'time µs':>9}  {'trig':>4}  " +
-                      "  ".join(f"{n:>18}" for n in ch_names))
-                print("  " + "-" * (6 + 9 + 4 + 18 * len(ch_names) + 20))
-                header_printed = True
-
-            ch_vals = [str(v["value"]) for v in stripe["channels"].values()]
-            print(f"  {stripe['record_number']:>6}  "
-                  f"{stripe['time_us']:>9}  "
-                  f"{'T' if stripe['trigger'] else '.':>4}  " +
-                  "  ".join(f"{v:>18}" for v in ch_vals))
-
+        print(f"\nCollecting 50 stripes (device period ~{meta.device_period_us} µs)...\n")
+        hdr_done = False
+        for stripe in session.stream_stripes(n=50, timeout_s=20):
+            items = list(stripe["channels"].values())
+            if not hdr_done:
+                cols = [f"{v['name']}({v['units']})" for v in items]
+                print(f"  {'rec#':>6}  {'time µs':>9}  T  " +
+                      "  ".join(f"{c:>14}" for c in cols))
+                print("  " + "-"*70)
+                hdr_done = True
+            vals = [str(v["value"]) for v in items]
+            print(f"  {stripe['record_number']:>6}  {stripe['time_us']:>9}  "
+                  f"{'T' if stripe['trigger'] else '.'}  " +
+                  "  ".join(f"{v:>14}" for v in vals))
     finally:
-        handle.close()
+        h.close()
         log.info("USB handle closed.")
-
     print("\nDone.")
 
 
