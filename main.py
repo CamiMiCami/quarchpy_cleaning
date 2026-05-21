@@ -160,6 +160,12 @@ class QuarchUSBHandle:
         self._ep_sz = self._dev.getMaxPacketSize(self._ep)
         log.debug("USB  EP=0x%02x  EP_SZ=%d", self._ep, self._ep_sz)
 
+        try:
+            self._handle.clearHalt(self._ep)  # Clear OUT pipe
+            self._handle.clearHalt(self._ep | 0x80)  # Clear IN pipe
+        except Exception as e:
+            log.debug("clearHalt ignored: %s", e)
+
         if self._ep_sz <= 64:           # PIC32 lock sequence
             self._write(self._UNLOCK); self._read(self._ep_sz, 500)
             self._write(self._LOCK);   self._read(self._ep_sz, 500)
@@ -222,10 +228,13 @@ class QuarchUSBHandle:
         self._handle.bulkWrite(endpoint=self._ep, data=data, timeout=USB_TIMEOUT_MS)
 
     def _read(self, n: int, timeout: int = USB_TIMEOUT_MS) -> bytes:
-        try:   return bytes(self._handle.bulkRead(self._ep, n, timeout))
+        try:
+            return bytes(self._handle.bulkRead(self._ep, n, timeout))
         except Exception as exc:
-            log.debug("bulk_read: %s", exc); return b""
-
+            # Ignore standard timeouts, but log actual hardware pipe errors!
+            if "TIMEOUT" not in str(exc):
+                log.error("USB Read Error: %s", exc)
+            return b""
 
 # ── stream session ───────────────────────────────────────────────────────────
 class PAMStreamSession:
