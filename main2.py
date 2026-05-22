@@ -1,8 +1,8 @@
 """
 pam_quarchpy_stream.py  –  Native quarchpy PAM Stream Extension (No QIS)
 
-This script uses the official `quarchpy` package for device discovery, USB
-connection, and text commands (bypassing QIS by using the "PY" ConType).
+This script uses the official `quarchpy` package for device discovery, USB 
+connection, and text commands (bypassing QIS by using the "PY" ConType). 
 It only injects a custom binary stream reader on top of the established connection.
 """
 
@@ -47,61 +47,50 @@ class StreamMeta:
     device_period_us: int = 4
     channels: list = field(default_factory=list)
 
+def _parse_time_us(s: str) -> int:
+    s = s.strip().lower()
+    if s.endswith("ns"): return max(1, int(s[:-2]) // 1000)
+    if s.endswith("us"): return int(s[:-2])
+    if s.endswith("ms"): return int(s[:-2]) * 1000
+    if s.endswith("s"):  return int(s[:-1]) * 1_000_000
+    return int(s) if s.isdigit() else 4
+
 # ── XML Parsers ──────────────────────────────────────────────────────────────
-def parse_config_xml(xml_text: str) -> list:
+def parse_stream_xml(xml_text: str) -> StreamMeta:
+    """Parses 'stream text header' XML from Quarch modules."""
     xml_text = xml_text.strip()
     start = xml_text.find("<?xml")
-    if start == -1: start = xml_text.find("<")
-    if start == -1: return []
+    if start == -1: start = xml_text.find("<header")
+    if start == -1: return StreamMeta()
+
     try:
         root = ET.fromstring(xml_text[start:])
-    except ET.ParseError: return []
+    except ET.ParseError: 
+        return StreamMeta()
 
-    channels, pos = [], 1
+    dp_str = root.findtext("devicePeriod") or root.findtext("devicePerioduS") or "4us"
+    dp_us = _parse_time_us(dp_str)
+
+    channels = []
     for ch in root.iter("channel"):
         name = (ch.findtext("name") or "").strip()
         if name.lower() in ("status", "trigger", ""): continue
+        
+        # Safely extract the exact integer index for this channel
+        pos_str = ch.findtext("dataPosition")
+        pos = int(pos_str) if pos_str and pos_str.isdigit() else (len(channels) + 1)
+
         channels.append(ChannelMeta(
             name=name,
             group=(ch.findtext("group") or "data").strip(),
             units=(ch.findtext("units") or "raw").strip(),
             data_position=pos
         ))
-        pos += 1
-    return channels
+    return StreamMeta(device_period_us=dp_us, channels=channels)
 
 def generic_channels(n_elements: int) -> list:
     return [ChannelMeta(name=f"ch{i}", group="data", units="raw", data_position=i)
             for i in range(1, n_elements)]
-
-# ── USB Recovery Function ────────────────────────────────────────────────────
-def recover_quarch_usb(dev):
-    """
-    Aggressively flushes residual binary data and halts from previous
-    crashed runs to ensure the pipe is pristine.
-    """
-    try:
-        hw = dev.connectionObj.connection.Connection
-        handle = hw.deviceHandle
-        ep = hw.QCmdEP
-
-        # Clear logical USB halts
-        try: handle.clearHalt(ep)
-        except: pass
-
-        # Force hardware to halt any active streams natively
-        try: hw.SendCommand("RECord TERMINATE")
-        except: pass
-
-        # Aggressively flush the pipe of all residual binary stripes
-        while True:
-            try:
-                c = handle.bulkRead(ep, 4096, 50)
-                if not c: break
-            except Exception:
-                break
-    except Exception as e:
-        log.debug("USB recovery skipped: %s", e)
 
 # ── Quarchpy Stream Hijacker ─────────────────────────────────────────────────
 class QuarchpyStreamer:
@@ -124,19 +113,20 @@ class QuarchpyStreamer:
             raise ValueError("Could not find the low-level USB handle in the quarchpy connection.")
 
     def discover_channels(self) -> StreamMeta:
-        log.info("Querying channel layout via quarchpy (config:supports?)...")
-        xml = self.dev.sendCommand("config:supports?")
-        channels = parse_config_xml(xml) if xml else []
+        log.info("Querying channel layout via quarchpy (stream text header)...")
+        self.dev.sendCommand("stream mode header v3")
+        xml = self.dev.sendCommand("stream text header")
+        
+        self.meta = parse_stream_xml(xml) if xml else StreamMeta()
 
-        if channels:
-            log.info("  Got %d channels from device XML:", len(channels))
-            for ch in channels:
+        if self.meta.channels:
+            log.info("  Got %d channels from device XML:", len(self.meta.channels))
+            for ch in self.meta.channels:
                 log.info("    [%d] %-18s group=%-10s units=%s",
                          ch.data_position, ch.name, ch.group, ch.units)
         else:
             log.info("  No channel XML — will derive from first stream packet.")
 
-        self.meta = StreamMeta(device_period_us=4, channels=channels)
         return self.meta
 
     def stream_stripes(self, n: int = 200, timeout_s: float = 20.0):
@@ -148,13 +138,10 @@ class QuarchpyStreamer:
         # 1. Enable stream mode
         self.dev.sendCommand("conf stream enable on")
 
-        # 2. Fire 'rec stream' using standard quarchpy command.
-        # This safely reads the "OK\n>" text response so the pipe is clean
-        # right before the device starts blasting binary data.
+        # 2. Fire the hardware binary start command.
+        # MUST use RECord RUN (hardware command), not 'rec stream' (QIS virtual command)!
         log.info("Starting hardware stream...")
-        resp = self.dev.sendCommand("rec stream")
-        if resp and "fail" in resp.lower():
-            raise RuntimeError(f"Device refused to stream: {resp}")
+        self.hw_if.RunCommand("RECord RUN", expectedResponse=False)
 
         # 3. Hijack the low-level USB handle from quarchpy
         handle = self.hw_if.deviceHandle
@@ -179,10 +166,14 @@ class QuarchpyStreamer:
 
                 # Process packets
                 while len(buf) >= RAW_STRIPE_HEADER_LEN:
+                    # Search for the 16-byte header signature to bypass the "OK\r\n>" text response
+                    # Since headerLength is always 16, we slide 1 byte forward until we hit it.
+                    h_len = struct.unpack_from("<i", buf, 0)[0]
+                    if h_len != RAW_STRIPE_HEADER_LEN:
+                        buf = buf[1:]
+                        continue
+
                     hdr = RawStripeDataHeader.from_bytes(buf)
-                    if hdr.header_length != RAW_STRIPE_HEADER_LEN:
-                        log.warning("Bad header_length=%d — resyncing", hdr.header_length)
-                        buf = buf[1:]; continue
 
                     stripe_sz = hdr.elements_per_stripe * 2
                     packet_sz = RAW_STRIPE_HEADER_LEN + (hdr.number_of_stripes * stripe_sz)
@@ -209,18 +200,16 @@ class QuarchpyStreamer:
         finally:
             log.info("Stopping hardware stream (%d stripes collected)...", collected)
 
-            # Fire stop command natively using raw SendCommand.
-            # This prevents quarchpy from crashing by trying to UTF-8 decode
-            # residual binary data currently stuck in the pipe.
+            # Fire hardware stop command
             try:
-                self.hw_if.SendCommand("rec stop")
+                self.hw_if.RunCommand("RECord STOP", expectedResponse=False)
             except Exception:
                 pass
 
-            # Flush residual binary stripes and the final "OK\n>"
-            self._flush(handle, ep, 150)
+            # Flush residual binary stripes and the final text prompt
+            self._flush(handle, ep, 250)
 
-            # Safely resync quarchpy's prompt expectation
+            # Safely resync quarchpy's prompt expectation so it can send commands again
             try:
                 self.dev.sendCommand("")
             except Exception:
@@ -263,28 +252,28 @@ def main():
     print("  Quarch PAM – Native quarchpy Binary Streamer")
     print("=" * 65)
 
-    # 1. Open the device using standard quarchpy
     log.info("Connecting to Quarch device...")
     found_device = quarchpy.scanDevices("all")
-
+    
     if not found_device:
         log.error("No Quarch devices found.")
         sys.exit(1)
-
+        
     target_id = list(found_device)[0]
     print(f"Found device: {target_id}")
-
+    
     # Initialize native Python connection (no QIS)
-    dev = quarchpy.quarchDevice(ConString=target_id, ConType="PY")
-
-    # USB Recovery: Scrub the pipe of residual data from previous crashes
-    log.info("Running USB state recovery...")
-    recover_quarch_usb(dev)
+    try:
+        dev = quarchpy.quarchDevice(ConString=target_id, ConType="PY")
+    except Exception as e:
+        log.error("quarchDevice failed to initialize. The USB pipe is likely halted.")
+        log.error("ACTION REQUIRED: Please UNPLUG the Quarch module from power/USB, wait 5s, and plug it back in.")
+        sys.exit(1)
 
     log.info("Device Connected: %s", dev.sendCommand("*idn?").strip())
     log.info("Power State: %s", dev.sendCommand("run:power?").strip())
 
-    # 2. Attach our custom streamer to the quarchpy connection
+    # Attach our custom streamer to the quarchpy connection
     streamer = QuarchpyStreamer(dev)
 
     try:
@@ -292,14 +281,14 @@ def main():
         # Requesting 50 stripes
         for stripe in streamer.stream_stripes(n=50, timeout_s=10):
             items = list(stripe["channels"].values())
-
+            
             # Print column headers on first stripe
             if not hdr_done:
                 cols = [f"{v['name']}({v['units']})" for v in items]
                 print(f"  {'rec#':>6}  {'time µs':>9}  T  " + "  ".join(f"{c:>14}" for c in cols))
                 print("  " + "-"*70)
                 hdr_done = True
-
+                
             # Print row values
             vals = [str(v["value"]) for v in items]
             print(f"  {stripe['record_number']:>6}  {stripe['time_us']:>9}  "
@@ -307,7 +296,7 @@ def main():
                   "  ".join(f"{v:>14}" for v in vals))
     finally:
         log.info("Closing quarchpy connection...")
-        dev.closeConnection()
+        dev.close()
 
 if __name__ == "__main__":
     main()
