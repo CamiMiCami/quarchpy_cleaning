@@ -14,6 +14,7 @@ def connect_to_pam():
         print(f"Connecting to {target_id}...")
         pam = quarchpy.quarchDevice(ConString=target_id, ConType="PY")
         #pam = quarchpy.quarchPPM(pam, skipDefaultSyntheticChannels=True)
+        pam.resetDevice()
 
         print("--- Communication Established ---")
         print("Send command: hello?")
@@ -27,6 +28,11 @@ def connect_to_pam():
         print("Send command: Connection Type?")
         print(f"Connection Type: {pam.ConCommsType}")
         print(f"Connection Name: {pam.connectionName}")
+        print(f"Stream Test???: {pam.sendCommand("RECord?")}")
+        print(f"Stream Test???: {pam.sendCommand("conf stream enable on")}")
+        print(f"Stream Test???: {pam.sendCommand("RECord RUN")}")
+        print(f"Stream Test???: {pam.sendCommand("RECord?")}")
+
 
     except Exception as e:
         print(f"Failed to connect: {e}")
