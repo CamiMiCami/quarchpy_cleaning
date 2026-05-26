@@ -40,7 +40,7 @@ def connect_to_pam():
         # 3. Extract the low-level USB interface and endpoints
         hw_if = pam.connectionObj.connection.Connection
         handle = hw_if.deviceHandle
-        # ep = hw_if.QCmdEP
+        ep = hw_if.QCmdEP
         # print(f"Show ep: {ep}")
 
         # 4. Arm the hardware
@@ -60,7 +60,7 @@ def connect_to_pam():
             while time.time() - start_time < 10.0:
                 try:
                     print("in the 10s time loop") # for debug
-                    chunk = handle.bulkRead(1, 4096, 1000)
+                    chunk = handle.bulkRead(endpoint=1, length=4096, timeout=1000) # endpoint should be 2 for PPM, 1 for all others
                     # chunk = handle.bulkRead(ep, 4096, 1000)
                     if chunk:
                         print("chunk exists loop") # for debug
@@ -113,6 +113,4 @@ def connect_to_pam():
             pam.closeConnection()
             print("Connection closed.")
 
-
-if __name__ == "__main__":
-    connect_to_pam()
+connect_to_pam()
