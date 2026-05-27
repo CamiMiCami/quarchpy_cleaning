@@ -97,11 +97,11 @@ def connect_to_pam():
         print("Flushing USB buffer...")
         while True:
             try:
-                c = handle.bulkRead(ep, 4096, 250)
-                if not c:
+                c = handle.bulkRead(1, 4096, 250)
+                d = handle.bulkRead(2, 4096, 250)
+                if not c or not d:
                     break
             except Exception:
-                # A timeout here means the buffer is successfully dry
                 break
 
         print("Done Clean!")
