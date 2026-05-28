@@ -636,6 +636,9 @@ class USBConn:
     def close(self):
         self.Connection.ClosePort()
         return True
+
+    def startStream(self):
+        return 0
     
     def sendCommand(self, Command, expectedResponse = True):
         Result = self.Connection.RunCommand(Command, expectedResponse)

@@ -5,13 +5,13 @@ using the format:
 """
 
 # Import the various functions which need to be called from the command line options
-from quarchpy.debug.SystemTest import main as systemTestMain
-from quarchpy.debug.module_debug import parse_arguments as moduleDebugMain
+# from quarchpy.debug.SystemTest import main as systemTestMain
+# from quarchpy.debug.module_debug import parse_arguments as moduleDebugMain
 from quarchpy.qis.qisFuncs import startLocalQis, isQisRunning, closeQis as closeQIS
 from quarchpy.qps.qpsFuncs import startLocalQps, isQpsRunning, closeQps as closeQPS
-from quarchpy.debug.upgrade_quarchpy import main as uprade_quarchpy_main
-from quarchpy.user_interface import*
-from quarchpy.debug.simple_terminal import main as simple_terminal_main
+# from quarchpy.debug.upgrade_quarchpy import main as uprade_quarchpy_main
+# from quarchpy.user_interface import*
+# from quarchpy.debug.simple_terminal import main as simple_terminal_main
 import sys, logging, traceback
 
 def main(args):
@@ -93,7 +93,7 @@ def _run_simple_terminal_function(args=None):
     """
     simple_terminal_main()
 
-def _run_debug_function(args=None):
+#def _run_debug_function(args=None):
     """
     Executes the python debug/system test option, returning details of the installation to the user
     for debug purposes
@@ -105,7 +105,7 @@ def _run_debug_function(args=None):
 
     """
 
-    systemTestMain(args)
+#    systemTestMain(args)
 
 def _run_module_debug_function(args=None):
     """

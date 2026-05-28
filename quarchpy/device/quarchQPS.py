@@ -162,11 +162,14 @@ class quarchStream:
             if 'pandas' in sys.modules or 'pd' in sys.modules:
                 logging.debug("Pandas already imported.")
             else:
-                import pandas as pd
+                try:
+                    import pandas as pd
+                except:
+                    pass
             pd.set_option('max_columns', None)
             pd.set_option('display.width', 1024)
         except:
-            logging.warning("pandas not imported correctly")
+            logging.warning("pandas not imported correctly (because I removed it)")
             pass
         command_response = self.connectionObj.qps.sendCmdVerbose("$get custom stats range " + str(start_time)+ " " + str(end_time), timeout=60)
         if command_response.startswith("Fail"):

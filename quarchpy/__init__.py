@@ -51,12 +51,12 @@ from connection_specific.connection_QPS import QpsInterface as qpsInterface
 from qis.qisFuncs import isQisRunning, startLocalQis, GetQisModuleSelection
 from qis.qisFuncs import closeQis as closeQIS
 from device.quarchPPM import quarchPPM
-from iometer.iometerFuncs import generateIcfFromCsvLineData, readIcfCsvLineData, generateIcfFromConf, runIOMeter, processIometerInstResults
+# from iometer.iometerFuncs import generateIcfFromCsvLineData, readIcfCsvLineData, generateIcfFromConf, runIOMeter, processIometerInstResults
 from device.quarchQPS import quarchQPS
 from qps.qpsFuncs import isQpsRunning, startLocalQps, GetQpsModuleSelection
 from qps.qpsFuncs import closeQps as closeQPS
-from disk_test.DiskTargetSelection import getDiskTargetSelection as GetDiskTargetSelection
+# from disk_test.DiskTargetSelection import getDiskTargetSelection as GetDiskTargetSelection
 from qps.qpsFuncs import toQpsTimeStamp as adjustTime
-from fio.FIO_interface import runFIO
+# from fio.FIO_interface import runFIO
 from device.scanDevices import scanDevices
 

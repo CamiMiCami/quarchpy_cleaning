@@ -1,7 +1,7 @@
 import re
 import time
 import sys
-wmi = None #global variable to inport WMI
+wmi = None # global variable to inport WMI
 from sys import platform
 from subprocess import check_output
 from quarchpy.disk_test.AbsDiskFinder import AbsDiskFinder

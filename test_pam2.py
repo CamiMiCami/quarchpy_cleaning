@@ -15,7 +15,9 @@ def connect_to_pam():
     try:
         print(f"Connecting to {target_id}...")
         pam = quarchpy.quarchDevice(ConString=target_id, ConType="PY")
+        print("RESET...")
         pam.sendCommand('*RST')
+        print("Sleeping...")
         time.sleep(5)
         pam = quarchpy.quarchDevice(ConString=target_id, ConType="PY")
 
@@ -31,7 +33,7 @@ def connect_to_pam():
 
         # 1. Set trigger to MANUAL (Bypasses waiting; starts instantly on RECord RUN)
         pam.sendCommand("RECord:TRIGger:MODE MANual")
-        pam.sendCommand("record:averaging 320k")
+        pam.sendCommand("record:averaging 32k")
         pam.sendCommand("RECord:TRIGger:ARM")
 
         # 2. Enable stream mode formatting
@@ -41,12 +43,16 @@ def connect_to_pam():
         hw_if = pam.connectionObj.connection.Connection
         handle = hw_if.deviceHandle
         ep = hw_if.QCmdEP
-        # print(f"Show ep: {ep}")
+        print(f"Show ep: {ep}")
 
         # 4. Arm the hardware
         print("Sending 'RECord RUN'...")
         # hw_if.RunCommand("RECord RUN", expectedResponse=False)
-        hw_if.RunCommand("rec stream", expectedResponse=False)
+        hw_if.RunCommand("rec:stream", expectedResponse=False)
+        print("===================START============================")
+        # hw_if.RunCommand("stream?")
+        print(hw_if.RunCommand("rec:stream?"))
+        print(quarchpy.scanDevices("all"))
 
         print("Reading stream (Running for 20 seconds)...\n")
         start_time = time.time()
@@ -60,24 +66,29 @@ def connect_to_pam():
             while time.time() - start_time < 10.0:
                 try:
                     print("in the 10s time loop") # for debug
-                    chunk = handle.bulkRead(endpoint=1, length=4096, timeout=1000) # endpoint should be 2 for PPM, 1 for all others
+                    chunk = handle.bulkRead(endpoint=1, length=2048, timeout=1000) # endpoint should be 2 for PPM, 1 for all others
                     # chunk = handle.bulkRead(ep, 4096, 1000)
                     if chunk:
                         print("chunk exists loop") # for debug
                         reads += 1
                         raw_bytes = bytes(chunk)
                         print(raw_bytes)
+                        print("ANS:")
+                        print(raw_bytes.decode("utf-8", errors="ignore"))
 
                         # Print the first 16 bytes of the chunk in Hex
-                        hex_preview = " ".join(f"{b:02X}" for b in raw_bytes[:16])
-                        print(f"Read {reads:03d} | Size: {len(raw_bytes):4d} bytes | Preview: {hex_preview}")
+                        # hex_preview = " ".join(f"{b:02X}" for b in raw_bytes[:16])
+                        # print(f"Read {reads:03d} | Size: {len(raw_bytes):4d} bytes | Preview: {hex_preview}")
 
-                except Exception as exc:
+                except Exception as e:
                     # libusb throws an exception on an empty pipe. Catch and continue.
-                    if "TIMEOUT" in str(exc).upper():
+                    if "TIMEOUT" in str(e).upper():
+                        print("Timeout reached")
+                        # print(pam.sendCommand("HELP record"))
+                        print(hw_if.RunCommand("rec:stream?"))
                         continue
                     else:
-                        print(f"Unexpected USB Error: {exc}")
+                        print(f"Unexpected USB Error: {e}")
                         break
 
         except KeyboardInterrupt:
@@ -90,7 +101,8 @@ def connect_to_pam():
 
         # Stop the recording at the hardware level
         try:
-            hw_if.RunCommand("RECord STOP", expectedResponse=False)
+            hw_if.RunCommand("RECord terminate", expectedResponse=False)
+            print("Terminated")
         except Exception:
             pass
 
@@ -98,8 +110,18 @@ def connect_to_pam():
         while True:
             try:
                 c = handle.bulkRead(1, 4096, 250)
-                d = handle.bulkRead(2, 4096, 250)
-                if not c or not d:
+                print("in flush try 1")
+                if not c:
+                    print("breaked")
+                    pass
+            except Exception:
+                pass
+
+            try:
+                c = handle.bulkRead(2, 4096, 250)
+                print("in flush try 2")
+                if not c:
+                    print("breaked")
                     break
             except Exception:
                 break

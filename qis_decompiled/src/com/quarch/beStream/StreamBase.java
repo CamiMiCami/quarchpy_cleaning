@@ -13,9 +13,7 @@ import src.com.quarch.beStream.StreamEventListener;
 import src.com.quarch.deviceInterface.DeviceListEntry;
 import src.com.quarch.devices.DeviceDataBuffer;
 
-public class StreamBase
-extends StreamDataReadyInitiater
-implements StreamEventListener,
+public class StreamBase extends StreamDataReadyInitiater implements StreamEventListener,
 Runnable {
     static List<StreamBase> streamList = new ArrayList<StreamBase>();
     protected volatile Object thread = Thread.State.NEW;

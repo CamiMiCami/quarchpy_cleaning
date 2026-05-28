@@ -29,7 +29,7 @@ extends BaseDevice {
     public long max5vCurrentValue;
     public long max12vVoltageValue;
     public long max12vCurrentValue;
-    public long max5vPowerValue;
+    public long max5vPowerValue
     public long max12vPowerValue;
     public long maxTotalPowerValue;
     protected BasePPM basePPM = new BasePPM();

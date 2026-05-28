@@ -7,8 +7,7 @@ import src.com.quarch.beStream.StreamBase;
 import src.com.quarch.deviceInterface.DeviceListEntry;
 import src.com.quarch.devices.DeviceDataBuffer;
 
-public class USBStream
-extends StreamBase {
+public class USBStream extends StreamBase {
     public USBStream(DeviceListEntry dle) {
         super(dle);
     }
